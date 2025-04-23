@@ -60,19 +60,13 @@ def tx_rx_NIDAQ(config, output_csv='received_data.csv'):
 
     time_axis = np.linspace(0, (config["n_meas"] / sample_rate)*1000, config["n_meas"])
 
-    # with open(output_csv, mode='w', newline='') as file:
-    #     writer = csv.writer(file)
-    #     writer.writerow(["Time (ms)", "Voltage (V)"])
-    #     writer.writerows(zip(time_axis, data))
-
     return time_axis, data, signal
 
 def calculateInvertedFilter(signal):
     f = np.zeros(int(config["sample_rate"] * config["T_sweep"]))
     for i in range(len(signal)):
         p = i/config["sample_rate"]
-        f[i] = config["amp"] * signal[int(config["sample_rate"] * config["T_sweep"])-1-i] * (2*math.pi*config["f1"]) / ((2*math.pi*config["f2"]) * math.exp(p/(config["T_sweep"]/math.log(f2/f1))))
-
+        f[i] = config["amp"] * signal[int(config["sample_rate"] * config["T_sweep"])-1-i] * (2*math.pi*config["f1"]) / ((2*math.pi*config["f2"]) * math.exp(p/(config["T_sweep"]/math.log(config["f2"]/config["f1"]))))
     return f
 
 def plot_received_signal(config):
@@ -82,14 +76,21 @@ def plot_received_signal(config):
     rir_measured_con = convolve(data, f, mode="full")
     rir_measured_con = rir_measured_con[len(signal):(len(signal)+config["n_meas"])]
     
+    with open("received_data.csv", mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(["Time (ms)", "Voltage (V)"])
+        writer.writerows(zip(time_axis[:len(rir_measured_con)], rir_measured_con))
+
     plt.figure(figsize=(10, 10))
-    plt.plot(time_axis, rir_measured_con, label="Received Signal", color='b')
+    plt.plot(time_axis[:len(rir_measured_con)], rir_measured_con, label="Received Signal", color='b')
     plt.xlabel("Time (ms)")
     plt.ylabel("Voltage (V)")
     plt.title("Real-Time Received Signal (40 kHz Block Pulse)")
     plt.legend()
     plt.grid()
     plt.show()
+
+
 
 def read_csv_data(filename):
     time_axis = []
