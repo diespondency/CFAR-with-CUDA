@@ -1,0 +1,936 @@
+# Utility functions for the package
+# Copyright (C) 2019  Sidney Barthe, Robin Scheibler, Ivan Dokmanic, Eric Bezzam
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# You should have received a copy of the MIT License along with this program. If
+# not, see <https://opensource.org/licenses/MIT>.
+from __future__ import division
+
+import fractions
+import functools
+import itertools
+import warnings
+
+import numpy as np
+from scipy import signal
+from scipy.io import wavfile
+
+from .doa import cart2spher
+from .parameters import constants, eps
+from .sync import correlate
+
+try:
+    import soxr
+
+    _has_soxr = True
+except ImportError:
+    _has_soxr = False
+
+try:
+    import samplerate
+
+    _has_samplerate = True
+except ImportError:
+    _has_samplerate = False
+
+
+def requires_matplotlib(func):
+    @functools.wraps(func)  # preserves name, docstrings, and signature of function
+    def function_wrapper(*args, **kwargs):
+        try:
+            import matplotlib.pyplot as plt
+
+            return func(*args, **kwargs)
+        except ImportError:
+            import warnings
+
+            warnings.warn("Matplotlib is required for plotting")
+            return
+
+    return function_wrapper
+
+
+def create_noisy_signal(signal_fp, snr, noise_fp=None, offset=None):
+    """
+    Create a noisy signal of a specified SNR.
+    Parameters
+    ----------
+    signal_fp : string
+        File path to clean input.
+    snr : float
+        SNR in dB.
+    noise_fp : string
+        File path to noise. Default is to use randomly generated white noise.
+    offset : float
+        Offset in seconds before starting the signal.
+
+    Returns
+    -------
+    numpy array
+        Noisy signal with specified SNR, between [-1,1] and zero mean.
+    numpy array
+        Clean signal, untouched from WAV file.
+    numpy array
+        Added noise such that specified SNR is met.
+    int
+        Sampling rate in Hz.
+
+    """
+    fs, clean_signal = wavfile.read(signal_fp)
+    clean_signal = to_float32(clean_signal)
+
+    if offset is not None:
+        offset_samp = int(offset * fs)
+    else:
+        offset_samp = 0
+    output_len = len(clean_signal) + offset_samp
+
+    if noise_fp is not None:
+        fs_n, noise = wavfile.read(noise_fp)
+        noise = to_float32(noise)
+        if fs_n != fs:
+            raise ValueError(
+                "Signal and noise WAV files should have same " "sampling rate."
+            )
+        # truncate to same length
+        if len(noise) < output_len:
+            raise ValueError(
+                "Length of signal file should be longer than " "noise file."
+            )
+        noise = noise[:output_len]
+    else:
+        if len(clean_signal.shape) > 1:  # multichannel
+            noise = np.random.randn(output_len, clean_signal.shape[1]).astype(
+                np.float32
+            )
+        else:
+            noise = np.random.randn(output_len).astype(np.float32)
+        noise = normalize(noise)
+
+    # weight noise according to desired SNR
+    signal_level = rms(clean_signal)
+    noise_level = rms(noise[offset_samp:])
+    noise_fact = signal_level / noise_level * 10 ** (-snr / 20)
+    noise_weighted = noise * noise_fact
+
+    # add signal and noise
+    noisy_signal = clean_signal + noise_weighted
+
+    # ensure between [-1, 1]
+    norm_fact = np.abs(noisy_signal).max()
+    clean_signal /= norm_fact
+    noise_weighted /= norm_fact
+    noisy_signal /= norm_fact
+
+    # remove any offset
+    noisy_signal -= noisy_signal.mean()
+
+    return noisy_signal, clean_signal, noise_weighted, fs
+
+
+def rms(data):
+    """
+    Compute root mean square of input.
+
+    Parameters
+    ----------
+    data : numpy array
+        Real signal in time domain.
+
+    Returns
+    -------
+    float
+        Root mean square.
+    """
+    return np.sqrt(np.mean(data * data))
+
+
+def to_float32(data):
+    """
+    Cast data (typically from WAV) to float32.
+
+    Parameters
+    ----------
+    data : numpy array
+        Real signal in time domain, typically obtained from WAV file.
+
+    Returns
+    -------
+    numpy array
+        `data` as float32.
+    """
+
+    if np.issubdtype(data.dtype, np.integer):
+        max_val = abs(np.iinfo(data.dtype).min)
+        return data.astype(np.float32) / max_val
+    else:
+        return data.astype(np.float32)
+
+
+def to_16b(signal):
+    """
+    converts float 32 bit signal (-1 to 1) to a signed 16 bits representation
+    No clipping in performed, you are responsible to ensure signal is within
+    the correct interval.
+    """
+    return ((2**15 - 1) * signal).astype(np.int16)
+
+
+def clip(signal, high, low):
+    """Clip a signal from above at high and from below at low."""
+    s = signal.copy()
+
+    s[np.where(s > high)] = high
+    s[np.where(s < low)] = low
+
+    return s
+
+
+def normalize(signal, bits=None):
+    """
+    normalize to be in a given range. The default is to normalize the maximum
+    amplitude to be one. An optional argument allows to normalize the signal
+    to be within the range of a given signed integer representation of bits.
+    """
+
+    s = signal.copy()
+
+    s /= np.abs(s).max()
+
+    # if one wants to scale for bits allocated
+    if bits is not None:
+        s *= 2 ** (bits - 1) - 1
+        s = clip(s, 2 ** (bits - 1) - 1, -(2 ** (bits - 1)))
+
+    return s
+
+
+def normalize_pwr(sig1, sig2):
+    """Normalize sig1 to have the same power as sig2."""
+
+    # average power per sample
+    p1 = np.mean(sig1**2)
+    p2 = np.mean(sig2**2)
+
+    # normalize
+    return sig1.copy() * np.sqrt(p2 / p1)
+
+
+def highpass(signal, Fs, fc=None, plot=False):
+    """Filter out the really low frequencies, default is below 50Hz"""
+
+    if fc is None:
+        fc = constants.get("fc_hp")
+
+    # have some predefined parameters
+    rp = 5  # minimum ripple in dB in pass-band
+    rs = 60  # minimum attenuation in dB in stop-band
+    n = 4  # order of the filter
+    type = "butter"
+
+    # normalized cut-off frequency
+    wc = 2.0 * fc / Fs
+
+    # design the filter
+    from scipy.signal import iirfilter, sosfiltfilt, sosfreqz
+
+    sos = iirfilter(n, Wn=wc, rp=rp, rs=rs, btype="highpass", ftype=type, output="sos")
+
+    # plot frequency response of filter if requested
+    if plot:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            import warnings
+
+            warnings.warn("Matplotlib is required for plotting")
+            return
+
+        w, h = sosfreqz(sos)
+
+        plt.figure()
+        plt.title("Digital filter frequency response")
+        plt.plot(w, 20 * np.log10(np.abs(h)))
+        plt.title("Digital filter frequency response")
+        plt.ylabel("Amplitude Response [dB]")
+        plt.xlabel("Frequency (rad/sample)")
+        plt.grid()
+
+    # apply the filter
+    signal = sosfiltfilt(sos, signal.copy())
+
+    return signal
+
+
+def time_dB(signal, Fs, bits=16):
+    """
+    Compute the signed dB amplitude of the oscillating signal
+    normalized wrt the number of bits used for the signal.
+    """
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        import warnings
+
+        warnings.warn("Matplotlib is required for plotting")
+        return
+
+    # min dB (least significant bit in dB)
+    lsb = -20 * np.log10(2.0) * (bits - 1)
+
+    # magnitude in dB (clipped)
+    pos = clip(signal, 2.0 ** (bits - 1) - 1, 1.0) / 2.0 ** (bits - 1)
+    neg = -clip(signal, -1.0, -(2.0 ** (bits - 1))) / 2.0 ** (bits - 1)
+
+    mag_pos = np.zeros(signal.shape)
+    Ip = np.where(pos > 0)
+    mag_pos[Ip] = 20 * np.log10(pos[Ip]) + lsb + 1
+
+    mag_neg = np.zeros(signal.shape)
+    In = np.where(neg > 0)
+    mag_neg[In] = 20 * np.log10(neg[In]) + lsb + 1
+
+    plt.plot(np.arange(len(signal)) / float(Fs), mag_pos - mag_neg)
+    plt.xlabel("Time [s]")
+    plt.ylabel("Amplitude [dB]")
+    plt.axis("tight")
+    plt.ylim(lsb - 1, -lsb + 1)
+
+    # draw ticks corresponding to decibels
+    div = 20
+    n = int(-lsb / div) + 1
+    yticks = np.zeros(2 * n)
+    yticks[:n] = lsb - 1 + np.arange(0, n * div, div)
+    yticks[n:] = -lsb + 1 - np.arange((n - 1) * div, -1, -div)
+    yticklabels = np.zeros(2 * n)
+    yticklabels = range(0, -n * div, -div) + range(-(n - 1) * div, 1, div)
+    plt.setp(plt.gca(), "yticks", yticks)
+    plt.setp(plt.gca(), "yticklabels", yticklabels)
+
+    plt.setp(plt.getp(plt.gca(), "ygridlines"), "ls", "--")
+
+
+def spectrum(signal, Fs, N):
+    from .stft import spectroplot, stft
+    from .windows import hann
+
+    F = stft(signal, N, N / 2, win=hann(N))
+    spectroplot(F.T, N, N / 2, Fs)
+
+
+def dB(signal, power=False):
+    if power is True:
+        return 10 * np.log10(np.abs(signal))
+    else:
+        return 20 * np.log10(np.abs(signal))
+
+
+def compare_plot(
+    signal1,
+    signal2,
+    Fs,
+    fft_size=512,
+    norm=False,
+    equal=False,
+    title1=None,
+    title2=None,
+):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        import warnings
+
+        warnings.warn("Matplotlib is required for plotting")
+        return
+
+    td_amp = np.maximum(np.abs(signal1).max(), np.abs(signal2).max())
+
+    if norm:
+        if equal:
+            signal1 /= np.abs(signal1).max()
+            signal2 /= np.abs(signal2).max()
+        else:
+            signal1 /= td_amp
+            signal2 /= td_amp
+        td_amp = 1.0
+
+    plt.subplot(2, 2, 1)
+    plt.plot(np.arange(len(signal1)) / float(Fs), signal1)
+    plt.axis("tight")
+    plt.ylim(-td_amp, td_amp)
+    if title1 is not None:
+        plt.title(title1)
+
+    plt.subplot(2, 2, 2)
+    plt.plot(np.arange(len(signal2)) / float(Fs), signal2)
+    plt.axis("tight")
+    plt.ylim(-td_amp, td_amp)
+    if title2 is not None:
+        plt.title(title2)
+
+    from .stft import spectroplot, stft
+    from .windows import hann
+
+    F1 = stft.stft(signal1, fft_size, fft_size / 2, win=windows.hann(fft_size))
+    F2 = stft.stft(signal2, fft_size, fft_size / 2, win=windows.hann(fft_size))
+
+    # try a fancy way to set the scale to avoid having the spectrum
+    # dominated by a few outliers
+    p_min = 1
+    p_max = 99.5
+    all_vals = np.concatenate((dB(F1 + eps), dB(F2 + eps))).flatten()
+    vmin, vmax = np.percentile(all_vals, [p_min, p_max])
+
+    cmap = "jet"
+    interpolation = "sinc"
+
+    plt.subplot(2, 2, 3)
+    stft.spectroplot(
+        F1.T,
+        fft_size,
+        fft_size / 2,
+        Fs,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=plt.get_cmap(cmap),
+        interpolation=interpolation,
+    )
+
+    plt.subplot(2, 2, 4)
+    stft.spectroplot(
+        F2.T,
+        fft_size,
+        fft_size / 2,
+        Fs,
+        vmin=vmin,
+        vmax=vmax,
+        cmap=plt.get_cmap(cmap),
+        interpolation=interpolation,
+    )
+
+
+def real_spectrum(signal, axis=-1, **kwargs):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        import warnings
+
+        warnings.warn("Matplotlib is required for plotting")
+        return
+
+    S = np.fft.rfft(signal, axis=axis)
+    f = np.arange(S.shape[axis]) / float(2 * S.shape[axis])
+
+    plt.subplot(2, 1, 1)
+    P = dB(S)
+    plt.plot(f, P, **kwargs)
+
+    plt.subplot(2, 1, 2)
+    phi = np.unwrap(np.angle(S))
+    plt.plot(f, phi, **kwargs)
+
+
+def convmtx(x, n):
+    """
+    Create a convolution matrix H for the vector x of size len(x) times n.
+    Then, the result of np.dot(H,v) where v is a vector of length n is the same
+    as np.convolve(x, v).
+    """
+
+    import scipy as s
+
+    c = np.concatenate((x, np.zeros(n - 1)))
+    r = np.zeros(n)
+
+    return s.linalg.toeplitz(c, r)
+
+
+def prony(x, p, q):
+    """
+    Prony's Method from Monson H. Hayes' Statistical Signal Processing, p. 154
+
+    Parameters
+    ----------
+
+    x:
+        signal to model
+    p:
+        order of denominator
+    q:
+        order of numerator
+
+    Returns
+    -------
+
+    a:
+        numerator coefficients
+    b:
+        denominator coefficients
+    err: the squared error of approximation
+    """
+
+    nx = x.shape[0]
+
+    if p + q >= nx:
+        raise NameError("Model order too large")
+
+    X = convmtx(x, p + 1)
+
+    Xq = X[q : nx + p - 1, 0:p]
+
+    a = np.concatenate(
+        (np.ones(1), -np.linalg.lstsq(Xq, X[q + 1 : nx + p, 0], rcond=None)[0])
+    )
+    b = np.dot(X[0 : q + 1, 0 : p + 1], a)
+
+    err = np.inner(np.conj(x[q + 1 : nx]), np.dot(X[q + 1 : nx, : p + 1], a))
+
+    return a, b, err
+
+
+def shanks(x, p, q):
+    """
+    Shank's Method from Monson H. Hayes' Statistical Signal Processing, p. 154
+
+    Parameters
+    ----------
+    x:
+        signal to model
+    p:
+        order of denominator
+    q:
+        order of numerator
+
+    Returns
+    -------
+    a:
+        numerator coefficients
+    b:
+        denominator coefficients
+    err:
+        the squared error of approximation
+    """
+
+    from scipy import signal
+
+    nx = x.shape[0]
+
+    if p + q >= nx:
+        raise NameError("Model order too large")
+
+    a = prony(x, p, q)[0]
+
+    u = np.zeros(nx)
+    u[0] = 1.0
+
+    g = signal.lfilter(np.ones(1), a, u)
+
+    G = convmtx(g, q + 1)
+    b = np.linalg.lstsq(G[:nx, :], x, rcond=None)[0]
+    err = np.inner(np.conj(x), x) - np.inner(np.conj(x), np.dot(G[:nx, : q + 1], b))
+
+    return a, b, err
+
+
+def low_pass_dirac(t0, alpha, Fs, N):
+    """
+    Creates a vector containing a lowpass Dirac of duration T sampled at Fs
+    with delay t0 and attenuation alpha.
+
+    If t0 and alpha are 2D column vectors of the same size, then the function
+    returns a matrix with each line corresponding to pair of t0/alpha values.
+    """
+
+    return alpha * np.sinc(np.arange(N) - Fs * t0)
+
+
+def fractional_delay(t0):
+    """
+    Creates a fractional delay filter using a windowed sinc function.
+    The length of the filter is fixed by the module wide constant
+    `frac_delay_length` (default 81).
+
+    Parameters
+    ----------
+    t0: float
+        The delay in fraction of sample. Typically between -1 and 1.
+
+    Returns
+    -------
+    numpy array
+        A fractional delay filter with specified delay.
+    """
+
+    N = constants.get("frac_delay_length")
+
+    if isinstance(t0, np.ndarray) and t0.ndim == 1:
+        t0 = t0[:, None]
+
+    return np.hanning(N) * np.sinc(np.arange(N) - (N - 1) / 2 - t0)
+
+
+def fractional_delay_filter_bank(delays):
+    """
+    Creates a fractional delay filter bank of windowed sinc filters
+
+    Parameters
+    ----------
+    delays: 1d narray
+        The delays corresponding to each filter in fractional samples
+
+    Returns
+    -------
+    numpy array
+        An ndarray where the ith row contains the fractional delay filter
+        corresponding to the ith delay. The number of columns of the matrix
+        is proportional to the maximum delay.
+    """
+
+    delays = np.array(delays)
+
+    # subtract the minimum delay, so that all delays are positive
+    delays -= delays.min()
+
+    # constants and lengths
+    N = delays.shape[0]
+    L = constants.get("frac_delay_length")
+    filter_length = L + int(np.ceil(delays).max())
+
+    # allocate a flat array for the filter bank that we'll reshape at the end
+    bank_flat = np.zeros(N * filter_length)
+
+    # separate delays in integer and fractional parts
+    di = np.floor(delays).astype(np.int64)
+    df = delays - di
+
+    # broadcasting tricks to compute at once all the locations
+    # and sinc times that must be computed
+    T = np.arange(L)
+    indices = T[None, :] + (di[:, None] + filter_length * np.arange(N)[:, None])
+    sinc_times = T - df[:, None] - (L - 1) / 2
+
+    # we'll need to window also all the sincs at once
+    windows = np.tile(np.hanning(L), N)
+
+    # compute all sinc with one call
+    bank_flat[indices.ravel()] = windows * np.sinc(sinc_times.ravel())
+
+    return np.reshape(bank_flat, (N, -1))
+
+
+def levinson(r, b):
+    """
+
+    Solve a system of the form Rx=b where R is hermitian toeplitz matrix and b
+    is any vector using the generalized Levinson recursion as described in M.H.
+    Hayes, Statistical Signal Processing and Modelling, p. 268.
+
+    Parameters
+    ----------
+    r:
+        First column of R, toeplitz hermitian matrix.
+    b:
+        The right-hand argument. If b is a matrix, the system is solved
+        for every column vector in b.
+
+    Returns
+    -------
+    numpy array
+        The solution of the linear system Rx = b.
+    """
+
+    p = b.shape[0]
+
+    a = np.array([1])
+    x = (
+        b[
+            np.newaxis,
+            0,
+        ]
+        / r[0]
+    )
+    epsilon = r[0]
+
+    for j in np.arange(1, p):
+        g = np.sum(np.conj(r[1 : j + 1]) * a[::-1])
+        gamma = -g / epsilon
+        a = np.concatenate((a, np.zeros(1))) + gamma * np.concatenate(
+            (np.zeros(1), np.conj(a[::-1]))
+        )
+        epsilon = epsilon * (1 - np.abs(gamma) ** 2)
+        delta = np.dot(np.conj(r[1 : j + 1]), np.flipud(x))
+        q = (b[j] - delta) / epsilon
+        if len(b.shape) == 1:
+            x = np.concatenate((x, np.zeros(1))) + q * np.conj(a[::-1])
+        else:
+            x = np.concatenate((x, np.zeros((1, b.shape[1]))), axis=0) + q * np.conj(
+                a[::-1, np.newaxis]
+            )
+
+    return x
+
+
+def autocorr(x, p, biased=True, method="numpy"):
+    """
+    Compute the autocorrelation for real signal `x` up to lag `p`.
+
+    Parameters
+    ----------
+    x : numpy array
+        Real signal in time domain.
+    p : int
+        Amount of lag. When solving for LPC coefficient, this is typically the
+        LPC order.
+    biased : bool
+        Whether to return biased autocorrelation (default) or unbiased. As
+        there are fewer samples for larger lags, the biased estimate tends to
+        have better statistical stability under noise.
+    method : 'numpy, 'fft', 'time', `pra`
+        Method for computing the autocorrelation: in the frequency domain with
+        `fft` or `pra` (`np.fft.rfft` is used so only real signals are
+        supported), in the time domain with `time`, or with `numpy`'s built-in
+        function `np.correlate` (default). For `p < log2(len(x))`, the time
+        domain approach may be more efficient.
+
+    Returns
+    -------
+    numpy array
+        Autocorrelation for `x` up to lag `p`.
+    """
+    L = len(x)
+    if method == "fft":
+        X = np.fft.rfft(np.r_[x, np.zeros_like(x)])
+        r = np.fft.irfft(X * np.conj(X))[: p + 1]
+    elif method == "time":
+        r = np.array([np.dot(x[: L - m], x[m:]) for m in range(p + 1)])
+    elif method == "numpy":
+        r = np.correlate(x, x, "full")[L - 1 : L + p]
+    elif method == "pra":
+        r = correlate(x, x)[L - 1 : L + p]
+    else:
+        raise ValueError(
+            "Invalid `method` for computing autocorrelation"
+            "choose one of: `fft`, `time`, `numpy`, `pra`."
+        )
+
+    if biased:
+        return r / L
+    else:
+        return r / np.arange(L, L - p - 1, step=-1)
+
+
+def lpc(x, p, biased=True):
+    """
+    Compute `p` LPC coefficients for a speech segment `x`.
+
+    Parameters
+    ----------
+    x : numpy array
+        Real signal in time domain.
+    p : int
+        Amount of lag. When solving for LPC coefficient, this is typically the
+        LPC order.
+    biased : bool
+        Whether to use biased autocorrelation (default) or unbiased. As there
+        are fewer samples for larger lags, the biased estimate tends to have
+        better statistical stability under noise.
+
+    Returns
+    -------
+    numpy array
+        `p` LPC coefficients.
+    """
+    # compute autocorrelation
+    r = autocorr(x, p, biased)
+
+    # solve Yule-Walker equations for LPC coefficients
+    return levinson(r[:p], r[1:])
+
+
+def goertzel(x, k):
+    """Goertzel algorithm to compute DFT coefficients"""
+
+    N = x.shape[0]
+    f = k / float(N)
+
+    a = np.r_[1.0, -2.0 * np.cos(2.0 * np.pi * f), 1.0]
+    b = np.r_[1]
+    s = signal.lfilter(b, a, x)
+    y = np.exp(2j * np.pi * f) * s[-1] - s[-2]
+
+    return y
+
+
+def all_combinations(lst1, lst2):
+    """
+    Return all combinations between two arrays.
+    """
+    return np.array(list(itertools.product(lst1, lst2)))
+
+
+"""
+GEOMETRY UTILITIES
+"""
+
+
+def angle_function(s1, v2):
+    """
+    Compute azimuth and colatitude angles in radians for a given set of points `s1`
+    with respect to a reference point `v2`.
+
+    Parameters
+    -----------
+    s1 : numpy array
+        3×N for a set of N 3-D points, 2×N for a set of N 2-D points.
+    v2 : numpy array
+        3×1 for a 3-D point, 2×1 for a 2-D point.
+
+    Returns
+    -----------
+    numpy array
+        2×N numpy array with azimuth and colatitude angles in radians in the
+        first and second row, respectively.
+        If the input vectors are 2-D, the colatitude is always fixed to pi/2.
+    """
+
+    if len(s1.shape) == 1:
+        s1 = s1[:, np.newaxis]
+    if len(v2.shape) == 1:
+        v2 = v2[:, np.newaxis]
+
+    assert s1.shape[0] == v2.shape[0]
+
+    ndim = s1.shape[0]
+    if ndim == 2:
+        s1 = np.concatenate((s1, np.zeros((1, s1.shape[1]))), axis=0)
+        v2 = np.concatenate((v2, np.zeros((1, v2.shape[1]))), axis=0)
+
+    # this is slightly wasteful for 2d points, but is safer as we are relying
+    # on tried and tested code
+    az, co, r = cart2spher(s1 - v2)
+
+    if ndim == 2:
+        # this is only necessary to handle correctly the case s1 - v2 = 0
+        # in this case cart2spher returns zero, but we would like to have
+        # colatitude = pi/2 for consistency
+        co[:] = np.pi / 2
+
+    return np.vstack((az, co))
+
+
+def resample(data, old_fs, new_fs, backend=None, *args, **kwargs):
+    """
+    Resample an ndarray from ``old_fs`` to ``new_fs`` along the last axis.
+
+    Parameters
+    ----------
+    data : numpy array
+        Input data to be resampled expected in shape (..., num_samples).
+    old_fs : int
+        Original sampling rate.
+    new_fs : int
+        New sampling rate.
+    backend: str
+        The resampling backend to use. Options are as follows.
+        All extra arguments are passed to the backend.
+
+        - `soxr`: The default backend. It is the fastest and most
+          accurate. It is not installed by default, but can be installed
+          via `pip install python-soxr`.
+        - `samplerate`: It is the first fallback backend. It is slower,
+          but as accurate as `soxr`. It is not installed by default, but can
+          be installed by `pip install samplerate`.
+        - `scipy`: It is the fallback when none of the other libraries
+          are installed. This uses `scipy.signal.resample_poly` and is not as
+          good as the other backend. This will generate a warning unless
+          specified explicitely.
+
+        The backend used package-wide is set via the constants,
+        e.g., `pra.constants.set("resample_backend", "soxr")`.
+
+    Returns
+    -------
+    The resampled signal.
+    """
+
+    if backend is None:
+        # get the package-wide default backend
+        backend = constants.get("resample_backend")
+
+    if backend not in ("soxr", "samplerate", "scipy"):
+        raise ValueError(
+            "Possible choices for the resampling backend are "
+            "soxr | samplerate | scippy."
+        )
+
+    # select the backend
+    if backend == "soxr" and not _has_soxr:
+        backend = "samplerate"
+
+    if backend == "samplerate" and not _has_samplerate:
+        backend = "scipy"
+        warnings.warn(
+            "Neither of the resampling backends `soxr` or `samplerate` are installed. "
+            "Falling back to scipy.signal.resample_poly. To silence this warning, "
+            "specify `backend=scipy` explicitely."
+        )
+
+    # format the data
+    ndim = data.ndim
+
+    # for samplerate and soxr the data needs to be in format
+    # (num_samples, num_channels)
+    if ndim == 1:
+        data = data[:, None]
+    elif ndim == 2:
+        data = data.T
+    else:
+        shape = data.shape
+        data = data.reshape(-1, data.shape[-1]).T
+
+    if backend == "soxr":
+        resampled_data = soxr.resample(data, old_fs, new_fs, *args, **kwargs)
+    elif backend == "samplerate":
+        resampled_data = samplerate.resample(
+            data, new_fs / old_fs, "sinc_best", *args, **kwargs
+        )
+    else:
+        # first, simplify the fraction
+        rate_frac = fractions.Fraction(int(new_fs), int(old_fs))
+        resampled_data = signal.resample_poly(
+            data,
+            up=rate_frac.numerator,
+            down=rate_frac.denominator,
+            axis=0,
+            *args,
+            **kwargs
+        )
+
+    # restore the original shape of the data
+    if ndim == 1:
+        resampled_data = resampled_data[:, 0]
+    elif ndim == 2:
+        resampled_data = resampled_data.T
+    else:
+        new_shape = shape[:-1] + resampled_data.shape[:1]
+        resampled_data = resampled_data.T.reshape(new_shape)
+
+    return resampled_data
