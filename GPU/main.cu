@@ -9,9 +9,9 @@
 
 int  guard_cells = 50;
 int  ref_cells   = 100;
-float bias       = -0.015f;      // now a float
+float bias       = -0.015f;      // float because data is float
 
-// CPU function (now floats)
+// CPU
 void sliding_cpu(const float* in,
                  float*       out,
                  unsigned int n,
@@ -35,7 +35,7 @@ void sliding_cpu(const float* in,
     }
 }
 
-// GPU kernel (now floats, bias passed in)
+// GPU kernel
 __global__ void sliding_gpu(const float*  in,
                             float*        out,
                             unsigned int  n,
@@ -57,7 +57,7 @@ __global__ void sliding_gpu(const float*  in,
 }
 
 int main() {
-    // --- 1) Read data.txt → voltages vector ---
+    // --- Read data.txt → voltages vector ---
     std::ifstream inFile("data_clean.txt");
     if (!inFile) {
         std::cerr << "Error: could not open data.txt\n";
@@ -84,7 +84,7 @@ int main() {
         return 1;
     }
 
-    // --- 2) Allocate host arrays ---
+    // --- 2) Create host arrays ---
     float *h_in      = voltages.data();          // input points at our vector
     float *h_out_cpu = new float[N];
     float *h_out_gpu = new float[N];
@@ -120,7 +120,7 @@ int main() {
 
     cudaMemcpy(h_out_gpu, d_out, bytes, cudaMemcpyDeviceToHost);
 
-    // --- 5) Validate & report ---
+    // --- 5) Check & Print ---
     bool match = true;
     for (unsigned int i = 0; i < N; ++i) {
         if (fabs(h_out_cpu[i] - h_out_gpu[i]) > 1e-5f) {
@@ -140,7 +140,7 @@ int main() {
                   << h_out_gpu[i] << "\n";
     }
 
-    // --- 6) Write out results.txt ---
+    // --- 6) Write to results.txt ---
     std::ofstream outFile("results.txt");
     if (!outFile) {
         std::cerr << "Error opening results.txt for writing\n";
