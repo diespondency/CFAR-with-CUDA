@@ -20,8 +20,8 @@
    "plot_signals": false,
    "plot_spectrogram": false,
    "plot_pulse_compr": false,
-   "amp":0.1,
-   "T_sweep":0.005,
+   "amp":1,
+   "T_sweep":0.01,
    "f1":20000,
    "f2":125000
  }
