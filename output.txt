@@ -1,0 +1,16 @@
+
+
+--------------------------------------------
+Performance Results (1000 kernel runs):
+--------------------------------------------
+CPU time:                         4.022970 ms
+GPU time, 1024 threads per block  0.030950 ms
+GPU time, 1024 threads            0.020651 ms
+Shared Memory GPU time:           0.006728 ms
+--------------------------------------------
+Speedup (CPU to GPU 1024):         129.98287x
+Speedup (GPU 1024 to GPU 481):      1.498717x
+Speedup (GPU 481 to Shared):        3.069541x
+Speedup (CPU to Shared):          597.969988x
+---------------------------------------------
+
